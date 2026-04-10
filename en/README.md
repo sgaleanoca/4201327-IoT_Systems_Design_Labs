@@ -187,7 +187,7 @@ Different audiences care about different aspects:
 - **Samuel (Architect)**: Technical depth, ISO alignment
 - **Gustavo (Product)**: Cost, performance, business value
 - **Edwin (Operations)**: Deployment, troubleshooting
-- **Sebastian (Security)**: Threat mitigation, compliance
+- **Edward (Security)**: Threat mitigation, compliance
 - **Daniela (Farmer)**: Test system on field
 
 ---
