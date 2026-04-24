@@ -4,7 +4,7 @@
 **GreenField Technologies - SoilSense Project**
 **Phase:** Core Connectivity
 **Duration:** 3 hours
-**ISO Domains:** RAID (Resource Access), SCD (Sensing & Controlling)
+**ISO Domains:** SCD (Sensing & Controlling), ASD (Application & Service)
 
 ---
 
@@ -37,7 +37,7 @@ We have selected **OpenThread** (IPv6 over Low-Power Wireless Personal Area Netw
 |---|---|---|
 | **Edwin (Ops)** | "If a cow steps on a node, does the network survive?" | You will simulate node failure and measure healing time. |
 | **Samuel (Architect)** | "Is the hop-count latency acceptable?" | You will measure RTT over 1 vs 3 hops. |
-| **ISO 30141 Auditor** | "How are resources accessed across the domain?" | You are implementing the **RAID** domain (Routing). |
+| **ISO 30141 Auditor** | "How do devices reach each other inside the sensing domain?" | You are extending the **SCD** with mesh routing, preparing the ground for **ASD** application traffic. |
 
 ---
 
@@ -47,20 +47,22 @@ We have selected **OpenThread** (IPv6 over Low-Power Wireless Personal Area Netw
 
 ```mermaid
 graph TD
-    subgraph RAID [Resource Access & Interchange Domain]
+    subgraph SCD [Sensing & Controlling Domain]
         Leader[Leader Router] <--> Router1[Router]
         Router1 <--> Router2[Router]
         Router2 <--> EndDevice[Sleepy End Device]
+        Sensor[Sensor] --> EndDevice
     end
-    subgraph SCD [Sensing & Controlling Domain]
-         Sensor[Sensor] --> EndDevice
+    subgraph ASD [Application & Service Domain]
+        AppTraffic[IPv6 application traffic<br/>e.g. CoAP in Lab 3]
     end
-    
-    style RAID fill:#f9f,stroke:#333,stroke-width:2px
+    SCD -.->|mesh-local IPv6<br/>enables app reachability| ASD
+
     style SCD fill:#bbf,stroke:#333,stroke-width:2px
+    style ASD fill:#bfb,stroke:#333,stroke-width:2px
 ```
 
-> **ISO/IEC 30141 Communication Type**: By adding mesh routing, you're building the **Proximity Network** into a self-healing topology. The standard notes that proximity networking is often limited to the SCD but enables the access network above it.
+> **ISO/IEC 30141 Communication Type**: By adding mesh routing, you're building the **Proximity Network** into a self-healing topology. The mesh itself lives in **SCD**; giving every node a stable IPv6 address is what lets **ASD** services address them in later labs.
 
 ---
 
@@ -112,7 +114,7 @@ Force a topology where Node A -> Node B -> Node C (3 hops).
 
 ### ISO/IEC 30141 Alignment (30 points)
 - [ ] Functional Viewpoint analysis (Router/Leader roles) (15 pts)
-- [ ] RAID domain mapping explained (15 pts)
+- [ ] SCD/ASD domain mapping explained (15 pts)
 
 ### Analysis (20 points)
 - [ ] ADR-002 (Topology) justification with latency vs range trade-off (10 pts)
