@@ -225,3 +225,127 @@ neighbor table
 - Convergence time measurements for re-attach
 - Thread network topology diagrams with roles
 - Comparative performance analysis with/without fragmentation
+
+---
+
+## Quick Command Reference (Lab 2 cheat-sheet)
+
+Keep this section open on a second screen during the lab. Commands grouped by [lab2.md](../lab2.md) task.
+
+### Task A — Commissioning
+
+**On Node A (becomes Leader):**
+```bash
+dataset init new
+dataset channel 20
+dataset panid 0xBEEF
+dataset networkname GreenField-G<team#>
+dataset commit active
+ifconfig up
+thread start
+
+# wait ~10 s:
+state              # expect: leader
+dataset active -x  # copy the hex blob that's printed
+```
+
+**On Nodes B and C:**
+```bash
+dataset set active <paste hex blob from A>
+ifconfig up
+thread start
+
+# wait ~10 s:
+state              # expect: router or child
+```
+
+**Verification (required deliverable):**
+```bash
+neighbor table     # confirm LQI > 100 for links you care about
+ipaddr             # list all IPv6 addresses (classify link-local / ML-EID / RLOC)
+router table       # see which nodes became routers
+```
+
+### Task B — 3-hop latency
+
+**Step 1. Force A→B→C topology.** Pick one method:
+
+- **Physical (recommended):** separate A and C by a wall or ≥15 m; keep B centered. Verify with `neighbor table` on A — C should be absent or LQI < 80.
+- **MAC filter (fallback):**
+  ```bash
+  # on A and C respectively:
+  extaddr                      # note each node's extended address
+
+  # on A:
+  macfilter addr denylist
+  macfilter addr add <C_extaddr>
+  # on C:
+  macfilter addr denylist
+  macfilter addr add <A_extaddr>
+  ```
+
+**Step 2. Get target address (on C):**
+```bash
+ipaddr mleid       # use THIS (mesh-local EID), not RLOC — stable across topology changes
+```
+
+**Step 3. Measure RTT (on A):**
+```bash
+ping <C_mleid> 64 20 500
+# size=64 bytes, count=20 pings, interval=500 ms
+```
+
+Read average/min/max RTT from the summary line. Compare to Lab 1's 1-hop RTT.
+
+**Step 4. Confirm the path went through B:**
+```bash
+router table       # on A — next-hop router toward C's RLOC16
+```
+
+### Task C — Tractor test (convergence)
+
+**Start continuous ping on A:**
+```bash
+ping <C_mleid> 64 200 1000
+# 200 pings, 1 per second — gives ~3 minutes of observation
+```
+
+**Physically unplug Node B.** Note the timestamp.
+
+**Observe pings timing out, then resuming.** Note the resume timestamp.
+
+**Convergence time = resume_ts − unplug_ts.** Target < 120 s.
+
+**Post-mortem on A:**
+```bash
+router table       # new next-hop toward C
+neighbor table     # B is gone
+```
+
+### Supporting commands
+
+| Command | Purpose |
+|---|---|
+| `state` | My role: leader / router / child / detached |
+| `ipaddr` | All IPv6 addresses on this interface |
+| `ipaddr mleid` | Just the ML-EID (stable app address) |
+| `ipaddr rloc` | Just the RLOC (topology-dependent) |
+| `extaddr` | My 802.15.4 extended (EUI-64) MAC address |
+| `rloc16` | My 16-bit short address |
+| `neighbor table` | Who I can hear, with LQI and avg RSSI |
+| `router table` | All routers in the mesh + cost/next-hop |
+| `routes` | External routes (empty until Lab 5) |
+| `dataset active` | Current network credentials |
+| `dataset active -x` | Same, as hex blob for pasting to other nodes |
+| `panid` / `channel` | Current PAN ID / channel |
+| `thread stop` | Leave the network cleanly |
+| `ifconfig down` | Bring radio interface down |
+| `factoryreset` | Wipe everything, fresh start |
+
+### Practical notes
+
+1. **Use ML-EID, not RLOC, for pings.** RLOC changes when topology changes; ML-EID is stable. This verifies the puzzle from the lecture.
+2. **Always `ifconfig up` before `thread start`.** Common first-time mistake.
+3. **If `state` stays `detached` for > 30 s**, check that channel + panid + networkkey match. Use `dataset active -x` on the working node and paste the whole blob into the others.
+4. **`ping` argument defaults vary by ESP-IDF version** — always specify size/count/interval explicitly.
+5. **If two groups collide on PANID**, you'll see each other in `neighbor table`. Pick a unique PANID (e.g., `0xBE<team#>`).
