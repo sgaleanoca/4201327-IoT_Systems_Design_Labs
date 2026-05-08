@@ -17,34 +17,32 @@ cd lab03
 idf.py set-target esp32c6
 ```
 
-In `idf.py menuconfig`, verify:
+The default flags from the `ot_cli` example are fine — OpenThread / FTD / CLI on, IPv6 on. No `menuconfig` changes are required for this lab.
 
+> **Two CoAP stacks are in play, and neither is a `menuconfig` toggle.** OpenThread's built-in CoAP API powers the `coap` CLI sub-command on Node B; it ships enabled by default in ESP-IDF v5.1+ via OpenThread's compile-time config (`OPENTHREAD_CONFIG_COAP_API_ENABLE=1` in the OpenThread component's `openthread-core-esp32x-ftd-config.h`). **libcoap** powers the server in `coap_demo.c` on Node A and is added as a managed component via `idf_component.yml`.
+
+Open `main/idf_component.yml` and add `espressif/coap` to the existing `dependencies:` block:
+
+```yaml
+dependencies:
+  espressif/coap:
+    version: "^4.3.0"
+  # ... keep the existing entries (esp_ot_cli_extension, idf, ot_led, ot_examples_common)
 ```
-Component config → OpenThread →
-  [*] Enable OpenThread
-  [*] Enable Full Thread Device (FTD)
-  [*] Enable OpenThread CLI
-  [*]   Enable CoAP support in OpenThread CLI    ← REQUIRED, off by default
-Component config → CoAP Configuration → [*] Enable CoAP debugging
-Component config → LWIP → [*] Enable IPv6
-```
 
-> **The `coap` sub-command is opt-in.** The stock `ot_cli` example does *not* build it. If you skip the highlighted flag, Node B's CLI will reject `coap start` with "Error: InvalidCommand" — see Troubleshooting. After you `coap start` on Node B, type `help` and you should see `coap` in the command list.
-
-> **Two CoAP libraries are involved**, intentionally:
-> - **OpenThread's built-in CoAP** powers the `coap` CLI command on Node B (client side).
-> - **libcoap** (added below) powers the server in `coap_demo.c` on Node A.
-> They are independent toggles, both must be on.
-
-Edit `main/CMakeLists.txt` to add the new source and the libcoap dependency:
+Edit `main/CMakeLists.txt` to add `coap_demo.c` as a source and the components the file uses:
 
 ```cmake
 idf_component_register(SRCS "esp_ot_cli.c" "coap_demo.c"
                        INCLUDE_DIRS "."
-                       REQUIRES openthread esp_openthread_cli libcoap)
+                       REQUIRES esp_event esp_netif nvs_flash openthread vfs
+                                ot_examples_common ot_led
+                                espressif__esp_ot_cli_extension coap)
 ```
 
-> The CLI source file may be named `esp_ot_cli.c` or `main.c` depending on your ESP-IDF version. Check `main/` and use whichever is there.
+> The CLI source file may be named `esp_ot_cli.c` or `main.c` depending on your ESP-IDF version. Use whichever is in `main/`.
+
+Run `idf.py reconfigure` once after saving so the component manager fetches libcoap into `managed_components/espressif__coap/` before the next build.
 
 ---
 
@@ -230,14 +228,14 @@ fd11:22:33:44:0:0:0:1
 
 ## 5. Test from Node B's CLI
 
-First sanity-check that the CoAP CLI is built in:
+Confirm the CoAP CLI is available:
 
 ```
 > help
 ... ipaddr ... ifconfig ... coap ... thread ...
 ```
 
-If `coap` is not in the list, you skipped the menuconfig flag in §1 — go back, enable it, rebuild & reflash. Then:
+Then:
 
 ```
 > coap start
@@ -290,7 +288,7 @@ Compare this against the HTTP equivalent for the same payload (see the [lecture'
 | `coap observe` returns 2.05 once and never again | `coap_resource_set_get_observable(..., 1)` must be called **before** `coap_add_resource`. |
 | Notifications stop arriving | Node B left the network. Re-run `coap observe ...`. |
 | Build error: `'coap_pdu_t' has no member named 'code'` | Tutorial code is libcoap-2. Use the v3 accessors in §3 above. |
-| `coap` not in `help` output, or `coap start` returns `Error: InvalidCommand` | The CoAP CLI flag from §1 is off. `menuconfig → OpenThread → [*] Enable CoAP support in OpenThread CLI`, rebuild & reflash. |
+| `coap` not in `help` output | OpenThread was built without `OPENTHREAD_CONFIG_COAP_API_ENABLE` (rare on ESP-IDF v5.1+; default is on). Update ESP-IDF, or set the define in the OpenThread component's `openthread-core-esp32x-ftd-config.h`. |
 | `state` stays `detached` on Node B | PANID / channel / network key mismatch. Re-paste `dataset active -x` from Node A; never type by hand. |
 
 ---
