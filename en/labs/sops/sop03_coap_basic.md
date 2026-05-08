@@ -1,266 +1,321 @@
-# SOP-03: Thread/CoAP Basic
+# SOP-03: Thread / CoAP / CBOR + Observe
 
-> **Main Lab Guide:** [Lab 3: Efficient Data Transport](../lab3.md)
-> **ISO Domains:** ASD (Application & Service Domain), UD (User Domain)
-> **GreenField Context:** Solving Daniela's battery drain problem with CoAP/CBOR efficiency
+> **Lab guide:** [Lab 3](../lab3.md) — read it first; the API contract, tasks, and DDR deliverables live there.
+> **This SOP:** firmware paste, build/flash/test steps, optional dashboard, troubleshooting. Total student-authored C: **two lines** (a forward declaration and a function call in `app_main`).
 
-## Objectives
-- Implement `/light` (GET/PUT) and `/sensor` (GET mock JSON) endpoints over CoAP on an existing Thread network.
-- Understand CoAP vs HTTP (overhead, methods, response codes).
-- Test basic CoAP communication using Thread CLI.
+The Thread mesh from [Lab 2](../lab2.md) is a prerequisite. Two ESP32-C6 boards. ESP-IDF v5.1+. If your CLI rejects `dataset masterkey`, use `dataset networkkey` — they're aliases on older builds.
 
-## Context
-This implementation guide provides step-by-step technical instructions for CoAP server implementation. It complements the [main lab guide](../lab3.md) which covers the energy efficiency rationale and CBOR compression theory.
+---
 
-## Project Setup
+## 1. Project & build configuration
 
-### 1. Create Project from ESP-IDF Example
+Create the project from the OpenThread CLI example and target the C6:
+
 ```bash
 idf.py create-project-from-example "$IDF_PATH/examples/openthread/ot_cli" lab03
 cd lab03
+idf.py set-target esp32c6
 ```
 
-### 2. Add CoAP Code Incrementally
+In `idf.py menuconfig`, verify:
 
-**Modify `main/main.c`** (add call to CoAP server):
-```c
-// Add at the end of app_main(), after esp_openthread_cli_init():
-ESP_LOGI(TAG, "OpenThread initialized with CLI");
-
-// Start CoAP server
-start_coap_server();
+```
+Component config → OpenThread →
+  [*] Enable OpenThread
+  [*] Enable Full Thread Device (FTD)
+  [*] Enable OpenThread CLI
+  [*]   Enable CoAP support in OpenThread CLI    ← REQUIRED, off by default
+Component config → CoAP Configuration → [*] Enable CoAP debugging
+Component config → LWIP → [*] Enable IPv6
 ```
 
-**Add forward declaration** at the beginning of the file:
-```c
-static const char *TAG = "iot_lab_base";
+> **The `coap` sub-command is opt-in.** The stock `ot_cli` example does *not* build it. If you skip the highlighted flag, Node B's CLI will reject `coap start` with "Error: InvalidCommand" — see Troubleshooting. After you `coap start` on Node B, type `help` and you should see `coap` in the command list.
 
-// Forward declaration
+> **Two CoAP libraries are involved**, intentionally:
+> - **OpenThread's built-in CoAP** powers the `coap` CLI command on Node B (client side).
+> - **libcoap** (added below) powers the server in `coap_demo.c` on Node A.
+> They are independent toggles, both must be on.
+
+Edit `main/CMakeLists.txt` to add the new source and the libcoap dependency:
+
+```cmake
+idf_component_register(SRCS "esp_ot_cli.c" "coap_demo.c"
+                       INCLUDE_DIRS "."
+                       REQUIRES openthread esp_openthread_cli libcoap)
+```
+
+> The CLI source file may be named `esp_ot_cli.c` or `main.c` depending on your ESP-IDF version. Check `main/` and use whichever is there.
+
+---
+
+## 2. Hook into `app_main` (your two lines)
+
+Open the existing CLI source file. Add at the top (after the includes):
+
+```c
 void start_coap_server(void);
 ```
 
-**Create `main/coap_demo.c`**:
+And at the end of `app_main`, after `esp_openthread_cli_init(...)`:
 
-**Step 1: Add includes and basic CoAP setup**
+```c
+start_coap_server();
+```
+
+That is the entire student-authored change to existing files.
+
+---
+
+## 3. Create `main/coap_demo.c`
+
+Paste verbatim. Complete server: CBOR encoding by hand, Observe push, 0.5 °C threshold gate.
+
 ```c
 #include <string.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <unistd.h>
-#include <sys/select.h>
-#include <errno.h>
+
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_random.h"
+
 #include "coap3/coap.h"
 
 static const char *TAG = "coap_demo";
 #define COAP_PORT 5683
-static bool light_on = false;
-static uint32_t sensor_counter = 0;
+
+static float g_current_temp = 24.5f;
+static float g_last_notified_temp = 24.5f;
+static coap_resource_t *g_env_temp_resource = NULL;
+
+// CBOR encoder for {"t": <float16>} — six bytes.
+//   A1            map(1)
+//   61 74         text(1) "t"
+//   F9 hh ll      float16, big-endian, IEEE 754 half-precision
+
+static uint16_t float32_to_float16(float f)
+{
+    uint32_t x;
+    memcpy(&x, &f, sizeof(x));
+    uint32_t sign = (x >> 16) & 0x8000;
+    int32_t  exp  = ((x >> 23) & 0xFF) - 127 + 15;
+    uint32_t mant = (x >>  13) & 0x3FF;
+    if (exp <= 0)   return (uint16_t)sign;                  // underflow → ±0
+    if (exp >= 31)  return (uint16_t)(sign | 0x7C00);       // overflow → ±inf
+    return (uint16_t)(sign | ((uint32_t)exp << 10) | mant);
+}
+
+static size_t encode_env_temp_cbor(float value, uint8_t out[6])
+{
+    uint16_t h = float32_to_float16(value);
+    out[0] = 0xA1; out[1] = 0x61; out[2] = 0x74;
+    out[3] = 0xF9; out[4] = (uint8_t)(h >> 8); out[5] = (uint8_t)(h & 0xFF);
+    return 6;
+}
+
+// /env/temp GET handler — libcoap-3 opaque-PDU API
+static void hnd_env_temp_get(coap_resource_t *resource,
+                             coap_session_t  *session,
+                             const coap_pdu_t *request,
+                             const coap_string_t *query,
+                             coap_pdu_t      *response)
+{
+    (void)session; (void)request; (void)query;
+
+    uint8_t buf[6];
+    size_t  len = encode_env_temp_cbor(g_current_temp, buf);
+
+    coap_pdu_set_code(response, COAP_RESPONSE_CODE_CONTENT);  // 2.05
+
+    unsigned char encoded[4];
+    coap_add_option(response, COAP_OPTION_CONTENT_FORMAT,
+                    coap_encode_var_safe(encoded, sizeof(encoded),
+                                          COAP_MEDIATYPE_APPLICATION_CBOR),
+                    encoded);
+    coap_add_data(response, len, buf);
+
+    ESP_LOGI(TAG, "GET /env/temp -> %.2f C (6 B CBOR)", g_current_temp);
+}
+
+// Drives Observe notifications. Mocks a slowly drifting sensor;
+// in Lab 4 this is replaced by the real ADC reading.
+static void temp_update_task(void *arg)
+{
+    coap_context_t *ctx = (coap_context_t *)arg;
+    while (1) {
+        float delta = ((float)(esp_random() % 1000) / 1000.0f - 0.5f) * 0.6f;   // ±0.3
+        if ((esp_random() % 10) == 0) delta += (esp_random() & 1) ? 1.5f : -1.5f;
+        g_current_temp += delta;
+
+        float diff = fabsf(g_current_temp - g_last_notified_temp);
+        if (diff > 0.5f) {
+            ESP_LOGI(TAG, "Δ=%.2f C exceeds threshold; notifying observers", diff);
+            g_last_notified_temp = g_current_temp;
+            if (g_env_temp_resource) coap_resource_notify_observers(g_env_temp_resource, NULL);
+        }
+
+        coap_io_process(ctx, 0);
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+}
+
+static void coap_server_task(void *pvParameters)
+{
+    (void)pvParameters;
+
+    coap_address_t addr;
+    coap_address_init(&addr);
+    addr.addr.sin6.sin6_family = AF_INET6;
+    addr.addr.sin6.sin6_port   = htons(COAP_PORT);
+    addr.addr.sin6.sin6_addr   = in6addr_any;
+
+    coap_set_log_level(COAP_LOG_WARN);
+    coap_context_t *ctx = coap_new_context(NULL);
+    if (!ctx) { ESP_LOGE(TAG, "coap_new_context failed"); vTaskDelete(NULL); return; }
+    coap_context_set_block_mode(ctx, COAP_BLOCK_USE_LIBCOAP);
+
+    if (!coap_new_endpoint(ctx, &addr, COAP_PROTO_UDP)) {
+        ESP_LOGE(TAG, "coap_new_endpoint failed");
+        coap_free_context(ctx); vTaskDelete(NULL); return;
+    }
+
+    g_env_temp_resource = coap_resource_init(coap_make_str_const("env/temp"), 0);
+    coap_register_handler(g_env_temp_resource, COAP_REQUEST_GET, hnd_env_temp_get);
+    coap_resource_set_get_observable(g_env_temp_resource, 1);
+    coap_add_resource(ctx, g_env_temp_resource);
+
+    ESP_LOGI(TAG, "CoAP server listening on UDP/%d, resource /env/temp", COAP_PORT);
+
+    xTaskCreate(temp_update_task, "temp_update", 4096, ctx, 4, NULL);
+    while (1) coap_io_process(ctx, 1000);
+}
 
 void start_coap_server(void)
 {
-    xTaskCreate(coap_server_task, "coap_server", 4096, NULL, 5, NULL);
+    xTaskCreate(coap_server_task, "coap_server", 6144, NULL, 5, NULL);
 }
 ```
 
-**Step 2: Add socket initialization**
-```c
-static void coap_server_task(void *pvParameters)
-{
-    coap_context_t *ctx = NULL;
-    coap_address_t dst;
-    coap_resource_t *light_resource = NULL;
-    coap_resource_t *sensor_resource = NULL;
-    fd_set readfds;
-    struct timeval tv;
-    int result;
-    coap_log_t log_level = COAP_LOG_WARN;
+> **API note:** this is the **libcoap-3** opaque-PDU API (`coap_pdu_set_code`, `coap_add_data`, `coap_resource_notify_observers`). Tutorials that access `request->code` directly are libcoap-2 and will not compile on current ESP-IDF.
 
-    coap_set_log_level(log_level);
-    coap_set_log_handler(NULL);
+---
 
-    coap_address_init(&dst);
-    dst.addr.sin6.sin6_family = AF_INET6;
-    dst.addr.sin6.sin6_port = htons(COAP_PORT);
-    dst.addr.sin6.sin6_addr = in6addr_any;
+## 4. Build, flash, commission
 
-    ctx = coap_new_context(NULL);
-    if (!ctx) {
-        ESP_LOGE(TAG, "Failed to create CoAP context");
-        return;
-    }
-
-    coap_new_endpoint(ctx, &dst, COAP_PROTO_UDP);
-
-    // Resources will be added in subsequent steps
-
-    ESP_LOGI(TAG, "CoAP server started on port %d", COAP_PORT);
-
-    while (1) {
-        FD_ZERO(&readfds);
-        FD_SET(coap_context_get_coap_fd(ctx), &readfds);
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
-
-        result = select(FD_SETSIZE, &readfds, 0, 0, &tv);
-        if (result > 0) {
-            if (FD_ISSET(coap_context_get_coap_fd(ctx), &readfds)) {
-                coap_io_process(ctx, COAP_IO_WAIT);
-            }
-        } else if (result < 0) {
-            break;
-        }
-    }
-
-finish:
-    coap_free_context(ctx);
-    coap_cleanup();
-    vTaskDelete(NULL);
-}
-```
-
-**Step 3: Add /light handler**
-```c
-static void handle_light(coap_context_t *ctx, coap_resource_t *resource,
-                          coap_session_t *session, coap_pdu_t *request,
-                          coap_binary_t *token, coap_string_t *query,
-                          coap_pdu_t *response)
-{
-    const char *response_data;
-    size_t response_data_len;
-
-    switch (request->code) {
-    case COAP_REQUEST_GET:
-        response->code = COAP_RESPONSE_CODE_CONTENT;
-        response_data = light_on ? "1" : "0";
-        response_data_len = strlen(response_data);
-        coap_add_data_blocked_response(resource, session, request, response,
-                                        token, COAP_MEDIATYPE_TEXT_PLAIN, 0,
-                                        response_data_len,
-                                        (const uint8_t *)response_data);
-        break;
-    case COAP_REQUEST_PUT:
-        if (request->data && request->data->length == 1 &&
-            (request->data->s[0] == '0' || request->data->s[0] == '1')) {
-            light_on = (request->data->s[0] == '1');
-            response->code = COAP_RESPONSE_CODE_CHANGED;
-        } else {
-            response->code = COAP_RESPONSE_CODE_BAD_REQUEST;
-        }
-        break;
-    default:
-        response->code = COAP_RESPONSE_CODE_METHOD_NOT_ALLOWED;
-        break;
-    }
-}
-```
-
-Add in `coap_server_task`, replacing the comment `// Resources will be added in subsequent steps`:
-```c
-light_resource = coap_resource_init(coap_make_str_const("light"), 0);
-if (!light_resource) {
-    ESP_LOGE(TAG, "Failed to create light resource");
-    goto finish;
-}
-coap_register_handler(light_resource, COAP_REQUEST_GET, handle_light);
-coap_register_handler(light_resource, COAP_REQUEST_PUT, handle_light);
-coap_add_resource(ctx, light_resource);
-```
-
-**Step 4: Add /sensor handler**
-```c
-static void handle_sensor(coap_context_t *ctx, coap_resource_t *resource,
-                           coap_session_t *session, coap_pdu_t *request,
-                           coap_binary_t *token, coap_string_t *query,
-                           coap_pdu_t *response)
-{
-    char payload[32];
-    size_t len;
-
-    if (request->code != COAP_REQUEST_GET) {
-        response->code = COAP_RESPONSE_CODE_METHOD_NOT_ALLOWED;
-        return;
-    }
-
-    sensor_counter++;
-    len = snprintf(payload, sizeof(payload), "{\"val\":%u}", sensor_counter);
-    response->code = COAP_RESPONSE_CODE_CONTENT;
-    coap_add_data_blocked_response(resource, session, request, response,
-                                    token, COAP_MEDIATYPE_APPLICATION_JSON, 0,
-                                    len, (const uint8_t *)payload);
-}
-```
-
-Add in `coap_server_task`, after the light_resource code:
-```c
-sensor_resource = coap_resource_init(coap_make_str_const("sensor"), 0);
-if (!sensor_resource) {
-    ESP_LOGE(TAG, "Failed to create sensor resource");
-    goto finish;
-}
-coap_register_handler(sensor_resource, COAP_REQUEST_GET, handle_sensor);
-coap_add_resource(ctx, sensor_resource);
-```
-
-**Modify `main/CMakeLists.txt`** to include CoAP:
-```cmake
-idf_component_register(SRCS "main.c" "coap_demo.c"
-                        INCLUDE_DIRS "."
-                        REQUIRES openthread libcoap esp_openthread_cli)
-```
-
-### 3. Configure Settings
-
-**Create/update `sdkconfig`** with required configurations:
 ```bash
-# OpenThread Configuration
-CONFIG_OPENTHREAD_ENABLED=y
-CONFIG_OPENTHREAD_CLI=y
-CONFIG_OPENTHREAD_FTD=y
-CONFIG_OPENTHREAD_JOINER=y
-
-# Network Configuration
-CONFIG_LWIP_IPV6=y
-
-# CoAP
-CONFIG_COAP_ENABLED=y
-
-# ESP32-C6 specific
-CONFIG_IDF_TARGET="esp32c6"
-```
-
-**Build and flash:**
-```bash
-idf.py set-target esp32c6
 idf.py build
-idf.py flash
-idf.py monitor
+idf.py -p /dev/ttyUSB0 flash monitor      # Node A (Server)
+idf.py -p /dev/ttyUSB1 flash monitor      # Node B (Client) — same firmware, used as CLI
 ```
 
-### 4. Test CoAP Using CLI
+Form the Thread mesh exactly as in [SOP-02](sop02_6lowpan.md). On Node A, after `state` shows `leader`, copy `dataset active -x` and paste it on Node B with `dataset set active <hex>`. Node A's monitor should print:
 
-For this lab, CoAP tests are performed directly from the Thread CLI on a second ESP32 node. Connect a second device and join the Thread network of the first node.
+```
+I (4321) coap_demo: CoAP server listening on UDP/5683, resource /env/temp
+```
 
-**On the second node (client):**
+On Node A, grab the address Node B will target:
+
+```
+> ipaddr mleid
+fd11:22:33:44:0:0:0:1
+```
+
+---
+
+## 5. Test from Node B's CLI
+
+First sanity-check that the CoAP CLI is built in:
+
+```
+> help
+... ipaddr ... ifconfig ... coap ... thread ...
+```
+
+If `coap` is not in the list, you skipped the menuconfig flag in §1 — go back, enable it, rebuild & reflash. Then:
+
+```
+> coap start
+> coap get fd11:22:33:44:0:0:0:1 /env/temp
+coap response from fd11:22:33:44:0:0:0:1 with payload: a16174f94e40
+
+> coap observe fd11:22:33:44:0:0:0:1 /env/temp
+   ...notifications arrive whenever Node A crosses the 0.5 °C threshold...
+
+> coap cancel fd11:22:33:44:0:0:0:1 /env/temp
+```
+
+The hex `a16174f94e40` decodes to `{"t": 24.5}` — that's the contract from [lab3.md §3](../lab3.md#3-the-api-contract--envtemp). Decode by hand or paste into [cbor.me](https://cbor.me).
+
+---
+
+## 6. Packet-size audit (for Task C)
+
+Add this one line inside `hnd_env_temp_get` just before `coap_add_data` if you want the payload length logged:
+
+```c
+ESP_LOGI(TAG, "CoAP response payload bytes: %u", (unsigned)len);
+```
+
+The total CoAP message size is fixed by the protocol — fill the right column with **your** measured payload:
+
+| Layer | Bytes | Note |
+|---|---|---|
+| CoAP fixed header | 4 | Ver/T/TKL + Code + Message ID |
+| Token | 4 | Default in OpenThread CLI |
+| Uri-Path `env` | 4 | Option header (1) + 3 chars |
+| Uri-Path `temp` | 5 | Option header (1) + 4 chars |
+| Content-Format | 2 | Value 60 fits in one byte |
+| Payload marker `0xFF` | 1 | |
+| Payload (CBOR) | 6 | From your log |
+| **Total CoAP** | **26 B** | |
+| UDP header | 8 | |
+| IPv6 header (uncompressed) | 40 | After 6LoWPAN IPHC: ~2–6 B |
+| **Total over 802.15.4 (compressed)** | **~36 B** | |
+
+Compare this against the HTTP equivalent for the same payload (see the [lecture's](../lectures/lab3_lecture.md) per-packet breakdown — ≥ 6 packets, ~500 B). The deliverable is the ratio.
+
+---
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `coap get` returns `4.04 Not Found` | The CLI strips the leading `/`; the resource is registered as `env/temp`. Path on the wire and registration must match. |
+| `coap observe` returns 2.05 once and never again | `coap_resource_set_get_observable(..., 1)` must be called **before** `coap_add_resource`. |
+| Notifications stop arriving | Node B left the network. Re-run `coap observe ...`. |
+| Build error: `'coap_pdu_t' has no member named 'code'` | Tutorial code is libcoap-2. Use the v3 accessors in §3 above. |
+| `coap` not in `help` output, or `coap start` returns `Error: InvalidCommand` | The CoAP CLI flag from §1 is off. `menuconfig → OpenThread → [*] Enable CoAP support in OpenThread CLI`, rebuild & reflash. |
+| `state` stays `detached` on Node B | PANID / channel / network key mismatch. Re-paste `dataset active -x` from Node A; never type by hand. |
+
+---
+
+## Appendix — Optional: a local dashboard (stretch goal)
+
+**This is not required for the lab.** The two `idf.py monitor` terminals already show everything you need to score the rubric. Skip this unless you've finished the deliverables and want to see the same Chart.js view as the Lab 0 / 0.5 dashboards, with live counters for "notifications received" and "1 Hz polls avoided".
+
+The dashboard reads Node B's monitor stream (no firmware change, no Border Router) and decodes each Observe notification's CBOR payload.
+
+**1. Pipe Node B's monitor through `tee`** (replaces the plain `idf.py monitor` you launched in §4):
+
 ```bash
-# Get dataset from leader (on the first device)
-# dataset active -x
-
-# Copy the hex dataset to the second device
-dataset set active <leader_hex_dataset>
-ifconfig up
-thread start
-
-# Once joined, test CoAP from CLI
-coap get [Server IPv6] /sensor
-coap put [Server IPv6] /light 1
+idf.py -p /dev/ttyUSB1 monitor | tee /tmp/nodeB.log
 ```
 
-## Deliverables
-- CLI captures showing Thread network formation (from Lab 2)
-- CoAP server logs with GET/PUT requests to `/light` and `/sensor`
-- CoAP vs HTTP comparison (overhead, methods, response codes)
-- Documentation of implemented endpoints and their functionality
+`tee` preserves the live console you already use *and* writes a copy to the file the dashboard reads. Linux/macOS native; on Windows use Git Bash, WSL, or PowerShell's `Tee-Object`.
+
+**2. In a third terminal:**
+
+```bash
+pip install flask
+python tools/dashboard_coap.py --log /tmp/nodeB.log
+```
+
+Open `http://localhost:5000`. Same Chart.js view as Labs 0 / 0.5; the stats card shows the live notification count and how many polls a 1 Hz client would have spent over the same window.
+
+**Why we keep this optional in Lab 3:** the goal of this lab is to understand the full stack from the CLI — `coap get`, the raw `a16174f9...` bytes, the `notifying observers` log line. Once those are clear, a graphical view adds polish but no insight. We bring the dashboard back as a first-class artifact in Lab 6, where it pairs naturally with secured CoAP (DTLS).

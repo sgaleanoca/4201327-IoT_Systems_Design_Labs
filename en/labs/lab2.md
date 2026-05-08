@@ -2,8 +2,11 @@
 > **Technical Guide:** [SOP-02: 6LoWPAN + Routing & Resilience](sops/sop02_6lowpan.md)
 
 **GreenField Technologies - SoilSense Project**
+
 **Phase:** Core Connectivity
+
 **Duration:** 3 hours
+
 **ISO Domains:** SCD (Sensing & Controlling), ASD (Application & Service)
 
 ---
