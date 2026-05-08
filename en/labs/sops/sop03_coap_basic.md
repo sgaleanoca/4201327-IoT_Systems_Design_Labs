@@ -48,13 +48,14 @@ Run `idf.py reconfigure` once after saving so the component manager fetches libc
 
 ## 2. Hook into `app_main` (your two lines)
 
-Open the existing CLI source file. Add at the top (after the includes):
+Open the existing CLI source file. Add at the top, after the includes and before `app_main`:
 
 ```c
+// Forward declaration — implemented in coap_demo.c
 void start_coap_server(void);
 ```
 
-And at the end of `app_main`, after `esp_openthread_cli_init(...)`:
+And add **one line at the very end of `app_main`**, after the existing initialization block (after `esp_openthread_start()` and any `#if CONFIG_OPENTHREAD_*` blocks):
 
 ```c
 start_coap_server();
