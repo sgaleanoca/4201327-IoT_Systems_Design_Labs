@@ -17,9 +17,17 @@ cd lab03
 idf.py set-target esp32c6
 ```
 
-The default flags from the `ot_cli` example are fine — OpenThread / FTD / CLI on, IPv6 on. No `menuconfig` changes are required for this lab.
+The default flags from the `ot_cli` example are fine — OpenThread / FTD / CLI on, IPv6 on. No `menuconfig` changes are required, but Node B needs **one header edit** to expose `coap observe` on the CLI (see callout below).
 
 > **Two CoAP stacks are in play, and neither is a `menuconfig` toggle.** OpenThread's built-in CoAP API powers the `coap` CLI sub-command on Node B; it ships enabled by default in ESP-IDF v5.1+ via OpenThread's compile-time config (`OPENTHREAD_CONFIG_COAP_API_ENABLE=1` in the OpenThread component's `openthread-core-esp32x-ftd-config.h`). **libcoap** powers the server in `coap_demo.c` on Node A and is added as a managed component via `idf_component.yml`.
+>
+> **`coap observe` is a separate flag and is OFF by default.** The OT CLI only registers the `observe` sub-command when `OPENTHREAD_CONFIG_COAP_OBSERVE_API_ENABLE=1`. Without it, `coap observe ...` returns `Error 35: InvalidCommand`. Open the **same header** where `OPENTHREAD_CONFIG_COAP_API_ENABLE` is defined (`components/openthread/openthread/src/core/config/coap.h`, or override via `openthread-core-esp32x-ftd-config.h`) and add right next to it:
+>
+> ```c
+> #define OPENTHREAD_CONFIG_COAP_OBSERVE_API_ENABLE 1
+> ```
+>
+> Then `idf.py fullclean && idf.py build flash monitor` on Node B. Do this once, before §6.
 
 Open `main/idf_component.yml` and add `espressif/coap` to the existing `dependencies:` block:
 
@@ -286,6 +294,7 @@ Compare this against the HTTP equivalent for the same payload (see the [lecture'
 | Symptom | Fix |
 |---|---|
 | `coap get` returns `4.04 Not Found` | The CLI strips the leading `/`; the resource is registered as `env/temp`. Path on the wire and registration must match. |
+| `coap observe ...` returns `Error 35: InvalidCommand` | OT CLI was built without `OPENTHREAD_CONFIG_COAP_OBSERVE_API_ENABLE`. Add the `#define ... 1` next to the CoAP API flag in the header (see §1 callout), then `fullclean` + rebuild Node B. |
 | `coap observe` returns 2.05 once and never again | `coap_resource_set_get_observable(..., 1)` must be called **before** `coap_add_resource`. |
 | Notifications stop arriving | Node B left the network. Re-run `coap observe ...`. |
 | Build error: `'coap_pdu_t' has no member named 'code'` | Tutorial code is libcoap-2. Use the v3 accessors in §3 above. |
