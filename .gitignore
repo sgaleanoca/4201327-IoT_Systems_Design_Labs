@@ -12,3 +12,4 @@
 __pycache__/
 .vscode/
 ISO_IEC_30141_2024(en).pdf
+tools/grading/*

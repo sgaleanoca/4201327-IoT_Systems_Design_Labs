@@ -1,126 +1,151 @@
-# Lab 4: Reliability & Downlink Control
-> **Technical Guide:** [SOP-04: Sensor Integration and Dashboards](sops/sop04_sensor_integration.md)
+# Lab 4: Reliable Downlink & Actuator Control (CoAP CON)
+> **Technical Guide:** [SOP-04: CoAP Downlink & Sleepy End Devices](sops/sop04_sensor_integration.md) — firmware paste, build steps, troubleshooting.
+> **Lecture:** [lab4_lecture.md](lectures/lab4_lecture.md)
 
-**GreenField Technologies - SoilSense Project**
+**GreenField Technologies — SoilSense Project**
+
 **Phase:** Control Logic
+
 **Duration:** 3 hours
-**ISO Domains:** SCD (Sensing/Controlling), ASD (Application)
+
+**ISO Domains:** ASD (Application & Service), SCD (Sensing & Controlling)
 
 ---
 
 ## 1. Project Context
 
-### Your Mission This Week
+**From:** Edwin (Field Ops) via Daniela — *"The 'OPEN VALVE' command went out at 06:00. The seedlings dried out anyway. The valve didn't move until 06:14."*
 
-**From:** Edwin (Field Operations Lead)
-**To:** Firmware Team
-**Subject:** The irrigation valve didn't open!
+You shipped efficient *uplink* in [Lab 3](lab3.md) — CoAP/CBOR + Observe. **Downlink is harder.** The valve node is a Sleepy End Device (SED): radio off ~99 % of the time. A GET/PUT addressed to it lands on its parent Router, and waits there until the SED wakes up to poll. Without CON's retransmit-on-loss, transient radio errors during that hand-off leave the client with no way to know whether the valve actually moved. **Mission:** add a CoAP `/act/valve` resource, drive it with **CON (Confirmable)** requests, and pick a poll period that trades latency for battery defensibly.
 
-We have a major issue. Last week's code works great for *reading* sensors (Uplink), but fails for *controlling* the water valves (Downlink).
-
-I tried to send an "OPEN" command from the HQ console to the valve node.
-1.  The command failed because the node was sleeping.
-2.  When the node finally woke up, it didn't know I had sent a command.
-3.  **Result:** The seedlings dried out.
-
-**Mission:** Implement a reliable Downlink mechanism.
-* The valve must eventually get the message, even if it sleeps.
-* We need acknowledgment (ACK) that the valve actually opened.
-
-— Edwin
-
-### Stakeholders Counting On You
-
-| Stakeholder | Their Question | How This Lab Helps |
+| Stakeholder | Their question | How this lab answers |
 |---|---|---|
-| **Edwin (Ops)** | "How do I control a sleeping device?" | Implementing CoAP polling and "Mailbox" patterns. |
-| **Samuel (Architect)** | "What if the message gets lost?" | Using CoAP **CON** (Confirmable) messaging. |
-| **ISO 30141 Auditor** | "Is the Actuation reliable?" | You are validating the **SCD** (Control) loop. |
+| **Edwin (Ops)** | How do I command a sleeping valve and *know* it opened? | CON + ACK gives end-to-end delivery confirmation. |
+| **Daniela (Farmer)** | Why does the valve lag 30 s after I tap "open"? | You tune the SED's parent-poll period — that's the lag. |
+| **ISO 30141 Auditor** | Is the actuation reliable? | CON retransmission, idempotent PUT, and a documented `/act/valve` contract in ASD. |
 
 ---
 
-## ISO/IEC 30141 Context
-
-### Visual Domain Mapping
+## 2. ISO/IEC 30141 placement
 
 ```mermaid
 graph TD
+    subgraph ASD [Application & Service Domain]
+        Valve[CoAP /act/valve<br/>CBOR {v: 0|1}]
+        Reliable["CON request → ACK<br/>retransmit on loss"]
+    end
     subgraph SCD [Sensing & Controlling Domain]
-        Sensor[Sensor] --> MCU
-        MCU --> Actuator[Valve/LED]
+        SED[Sleepy End Device<br/>poll period = X s]
+        Parent[Parent Router<br/>holds mailbox]
     end
-    subgraph ASD [Application and Service Domain]
-        Cloud[Cloud/User] --"Downlink (Command)"--> MCU
-        MCU --"Uplink (Ack)"--> Cloud
-    end
-    
-    style SCD fill:#bbf,stroke:#333,stroke-width:2px
-    style ASD fill:#f9f,stroke:#333,stroke-width:2px
+    Valve --> Reliable
+    Reliable -.->|stored at parent until poll| Parent
+    Parent -.->|delivered on next poll| SED
+
+    style ASD fill:#f9f,stroke:#333
+    style SCD fill:#bbf,stroke:#333
 ```
 
-> **ISO/IEC 30141 Communication Type**: Downlink control (commands to actuators) flows through the **Access Network**. The standard emphasizes that access networking supports both data transfer and management/control signals.
+**Still mostly ASD with a foot in SCD.** Lab 3 added the uplink contract on ASD; today's downlink contract — `/act/valve`, PUT semantics, CBOR `{v: 0|1}`, CON delivery — is also ASD. The **SED poll period and the parent-mailbox buffering** are SCD: they belong to the device's communication subsystem, not to the application.
 
-### Emergent Characteristic: Functional/Management Separation
-
-Notice that your downlink commands (CoAP PUT to `/farm/valve`) travel on the **functional plane**, while Thread's network healing — when a router dies or a new device joins — happens on the **management plane**. These two planes operate independently: a network reconfiguration does not interrupt your pending CoAP transactions; they simply get rerouted through an alternate path. This is ISO/IEC 30141 Section 6.2.2.3.3 in action.
+**Functional / management plane separation (ISO §6.2.2.3.3):** CoAP CON retransmits live on the functional plane; Thread MLE keeps the SED↔parent attachment alive on the management plane. The valve can re-parent (MLE) mid-flight without losing your in-flight CON (the new parent re-receives the retransmit).
 
 ---
 
-## 2. Theory Preamble (15 min)
-*Reference: [Theory Foundations](../5_theory_foundations.md) > Lab 4: Reliability & Downlink*
+## 3. The API contract — `/act/valve`
 
-* **Uplink vs Downlink:** Sending data *to* the cloud is easy (Node initiates). Receiving data *from* the cloud is hard (Node is asleep).
-* **Poll Period:** The "Sleepy End Device" must wake up periodically (e.g., every 5s) to ask its parent: "Do you have messages for me?"
-* **Idempotency:** If I send "OPEN VALVE" twice by mistake, it shouldn't open, close, and open again. It should just stay open.
+This is the artifact you cite in ADR-004. The firmware in [SOP-04 §3](sops/sop04_sensor_integration.md#3-create-mainvalve_democ) produces exactly this.
 
-> **In other stacks:** MQTT handles downlink naturally via subscriptions — the broker queues messages for sleeping clients. In LoRaWAN, downlink is severely limited (Class A devices can only receive in short windows after uplink). CoAP's approach (polling + confirmable messages) sits between these extremes.
+| | |
+|---|---|
+| **Resource** | `/act/valve` |
+| **Transport** | CoAP / UDP / port 5683 |
+| **Methods** | `PUT` (CON), `GET` (CON or NON) |
+| **Content-Format** | `60` (`application/cbor`) |
+| **Idempotency** | PUT same value twice → same state, ACK each time, no side effect on the second |
+| **Reliability policy** | CON; ACK_TIMEOUT = 2 s, MAX_RETRANSMIT = 4, ACK_RANDOM_FACTOR = 1.5 → max wait ≈ 45 s before client gives up |
 
----
+**Payload (4 bytes either direction):**
 
-## 3. Execution Tasks
+```
+A1            map(1)
+61 76         text(1) "v"
+0X            unsigned 0 or 1   ; CBOR small-uint
+```
 
-### Task A: The Actuator Resource
-Create a CoAP resource `/farm/valve`.
-* **PUT:** Accepts "1" (Open) or "0" (Close).
-* **GET:** Returns current state.
-* **Hardware:** Connect an LED to GPIO to simulate the Valve.
+| `v` | Wire bytes |
+|---|---|
+| 0 (closed) | `A1 61 76 00` |
+| 1 (open)   | `A1 61 76 01` |
 
-### Task B: Reliable Messaging (CON)
-Modify your client to send **CON (Confirmable)** requests.
-* **Experiment:** Unplug the Valve node. Send the command.
-* **Observe:** The client should retry (Exponential Backoff) and eventually timeout.
-* **Reconnect:** Plug the node back in. Send command. Verify the Client receives an ACK.
+**CDDL schema (RFC 8610):**
 
-### Task C: Tuning the "Poll Period"
-* **Scenario:** Set `POLL_PERIOD` to 10 seconds.
-* **Test:** Send a command. Measure the lag.
-* **Trade-off:** Fast response = High battery usage. Slow response = Frustrated Edwin.
-* **Goal:** Find the "Sweet Spot" (ADR required).
+```
+valve-cmd = {
+  v: 0 / 1   ; 0 = closed, 1 = open
+}
+```
 
----
-
-## 4. Deliverables (Update your DDR)
-
-* **ADR-004 (Latency):** What Poll Period did you choose? Why? (Map to **User Domain** requirements).
-* **Reliability Check:** Screenshot of the CoAP ACK packet in Wireshark.
+**Response codes:** `2.04 Changed` on PUT success (piggybacked in the ACK); `2.05 Content` on GET; `4.00 Bad Request` if CBOR doesn't decode to `{v: 0|1}`; `4.05 Method Not Allowed` for anything but PUT/GET.
 
 ---
 
-## Grading Rubric (Total: 100 points)
+## 4. Execution
 
-### Technical Execution (40 points)
-- [ ] Actuator resource `/farm/valve` responds to PUT/GET (10 pts)
-- [ ] CON messaging verified with node disconnection test (15 pts)
-- [ ] Poll period tuning experiment completed (15 pts)
+The firmware is provided in full — [SOP-04 §1–§3](sops/sop04_sensor_integration.md). Paste, build, flash three boards — **Node A** (Lab 3 `/env/temp` server, FTD), **Node B** (CLI client, FTD), **Node V** (the valve, MTD/SED running `/act/valve`) — and commission them onto the Thread mesh from Lab 2. **You author no C beyond the same two declaration lines as Lab 3.** Evaluation is done from the three `idf.py monitor` terminals.
 
-### ISO/IEC 30141 Alignment (30 points)
-- [ ] SCD domain (Actuation) validation (15 pts)
-- [ ] Reliability/Feedback loop concept explained (15 pts)
+### Task A — `/act/valve` round-trip
+- From Node B's CLI: `coap put <valve_mleid> /act/valve con tlv 60 a1617601` (sets `v=1`).
+- Confirm the valve's LED turns on **and** Node B's log shows `2.04 Changed`.
+- `coap get <valve_mleid> /act/valve` — payload should come back as `a1617601`.
+- Send `a1617600` (PUT, sets `v=0`). Confirm LED off + `2.04 Changed` + GET returns `a1617600`.
+- **Evidence:** Node B log (PUT + GET pairs) + Node V log + LED photo / state observation.
 
-### Analysis (20 points)
-- [ ] ADR-004 (Latency/Poll Period) justification (10 pts)
-- [ ] Idempotency concept explained in context (10 pts)
+### Task B — CON reliability under loss
+- Disconnect Node V (pull USB or run `thread stop` on it).
+- From Node B: `coap put <valve_mleid> /act/valve con tlv 60 a1617601`.
+- **Observe** the retransmission schedule in Node B's log: 4 retransmits at roughly **2 s → 4 s → 8 s → 16 s** intervals (each doubled, with ±50 % jitter); the client then waits one more ACK-window before surfacing `timeout` (total envelope ≈ 45 s).
+- Plug Node V back in (`thread start` or replug). Re-issue the PUT. Verify the ACK lands.
+- **Evidence:** annotated Node B log showing the four retransmit intervals and final timeout, then the successful ACK after recovery.
 
-### Ethics Checkpoint (Mandatory Pass/Fail)
-- [ ] **Safety**: What happens if the valve receives "OPEN" but the network dies before "CLOSE"? (Failsafe design).
-- [ ] **Privacy**: Did you minimize data collection in the Uplink while testing Downlink?
+### Task C — SED poll period vs latency (the headline trade-off)
+
+The valve is a **Sleepy End Device**. It wakes every `poll_period` seconds, asks its parent "any mail?", drains the mailbox, processes, sleeps. The poll period sets the **worst-case downlink latency** and the **dominant energy cost**.
+
+Run the same `coap put` three times with three poll periods and fill in the table from your own measurements ([SOP-04 §7](sops/sop04_sensor_integration.md#7-poll-period-experiment-task-c) walks the steps):
+
+| `poll_period` | Worst-case latency (your measurement) | Estimated radio-on duty cycle | Estimated battery life on 2×AA |
+|---|---|---|---|
+| **1 s**   | ____ s | ____ % | ____ days |
+| **5 s**   | ____ s | ____ % | ____ days |
+| **30 s**  | ____ s | ____ % | ____ days |
+
+Use ESP32-C6 RX current ≈ 75 mA and sleep current ≈ 5 µA. Energy per poll = `t_radio_on × I_rx`; one AA ≈ 2500 mAh; budget is 2 AA in series. Show the arithmetic.
+
+**Deliverable in your DDR:** the table above with all three rows filled in, plus one sentence picking the value Edwin should run in the field and why.
+
+---
+
+## 5. Deliverables — DDR updates
+
+Update [your DDR](../3_deliverables_template.md):
+
+- **§2 Lab Log → "Lab 4: Downlink & CON" → To Edwin.** Two short paragraphs: did the valve respond reliably under loss, and what poll period buys what battery life.
+- **§3 ADR-004: Poll period for SED actuators.** Context (Edwin's lag complaint, Daniela's battery complaint), decision (the period you picked), rationale (cite Task C numbers), status. Explicitly state the latency *and* battery numbers behind the choice.
+- **§4 ISO Mapping.** Add `/act/valve` and the CDDL schema as ASD entries; mark **CON retransmission** as an ASD reliability mechanism and **SED parent-poll** as an SCD communication-subsystem mechanism.
+- **§5 First Principles, Lab 4.** One sentence each: why PUT is safe to retransmit but POST is not; why CON's exponential backoff matches a lossy radio better than a fixed retry; why the SED poll period is a *policy*, not a CoAP parameter.
+- **§6 Performance Baselines.** Fill in the "Lab 4: Downlink Latency" row with your chosen poll period's worst-case from Task C — target < 30 s at 5 s poll.
+- **§7 Ethics & Sustainability.** Safety: what happens if the valve receives "OPEN" but the network dies before "CLOSE"? Design a failsafe (timeout on the actuator side, watchdog, default-closed). Sustainability: a 1 s poll buys you snappy response and ~6× shorter battery life — defensible only if a stakeholder needs it.
+- **Energy calculation.** Extend your Lab 3 energy spreadsheet with the SED poll cost. At your chosen poll period, what's the dominant term — uplink Observe traffic (Lab 3), or the bare poll itself? Use the radio-RX current from [references.md](../references.md).
+
+---
+
+## Grading rubric (100 pts)
+
+**Technical execution (40)** — `/act/valve` PUT/GET works (10) · CON retransmit + ACK verified under disconnect (15) · Three poll periods measured (15)
+
+**ISO/IEC 30141 alignment (30)** — ASD downlink contract documented (15) · ASD/SCD split for reliability vs poll mechanism explained (15)
+
+**Analysis (20)** — ADR-004 justification with latency *and* battery numbers (10) · Idempotency reasoning in context (10)
+
+**Ethics (pass/fail)** — Safety: failsafe for "OPEN then network dies" described · Sustainability: the poll-period choice is defensible in stakeholder terms, not just "felt right"
